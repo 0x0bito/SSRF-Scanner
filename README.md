@@ -60,7 +60,9 @@ SSRF được xếp vào **CWE-918** và nằm trong **OWASP Top 10 (A10:2021)**
 - ✅ **Mức độ tin cậy chuẩn ngành**: `CONFIRMED` / `FIRM` / `TENTATIVE` (mô hình Burp Suite), kèm Severity + CWE
 - ✅ **Bộ payload + bypass filter**: IP decimal/hex/octal, loopback thay thế, `@`, IPv6, `file://`, `dict://`
 - ✅ **Server canary OAST cục bộ** tự động xác nhận callback (bắt cả blind SSRF); hỗ trợ dịch vụ OOB ngoài (requestrepo/interactsh)
-- ✅ **Nhập input linh hoạt**: URL/param/marker `FUZZ`, body POST, cookie/session, đăng nhập user/pass
+- ✅ **Nhiều điểm chèn**: query, body **form**, body **JSON**, và **header** (`Referer`, `X-Forwarded-For`...)
+- ✅ **Lọc nhiễu thông minh**: baseline "host chết" → chỉ cảnh báo khi thực sự fetch được gì đó (giảm false-positive mạnh); có `--only-confirmed`
+- ✅ **Nhập input linh hoạt**: URL/param/marker `FUZZ`, body POST, cookie/session, đăng nhập user/pass, **proxy qua Burp** (`--proxy`)
 - ✅ **Import raw HTTP request từ Burp Suite** (`-r`) và **chế độ tương tác** (`-i`)
 - ✅ **Module khai thác** (sau khi phát hiện): `readfiles` (đọc file nội bộ), `cloud` (lôi metadata AWS/Alibaba), `portscan` (quét cổng nội bộ qua SSRF)
 - ✅ **Quét đa luồng** (ThreadPoolExecutor), **xuất báo cáo JSON**
@@ -169,13 +171,27 @@ python ssrf_scanner.py -u "http://host/fetch?url=FUZZ" -m readfiles,cloud,portsc
 
 | Nhóm | Cờ |
 |---|---|
-| **Mục tiêu** | `-u/--url`, `-r/--request` (Burp), `--https`, `-p/--param`, `-X/--method`, `--data`, `-H/--header` |
+| **Mục tiêu** | `-u/--url`, `-r/--request` (Burp), `--https`, `-p/--param`, `-X/--method`, `--data`, `--json`, `-H/--header` |
 | **Phiên / đăng nhập** | `--cookie`, `--auth-url`, `--auth-user`, `--auth-pass`, `--auth-user-field`, `--auth-pass-field` |
 | **OOB / OAST** | `--oast-listen` (canary cục bộ, tự xác nhận), `--oob-url` / `--oast-host` (dịch vụ ngoài) |
 | **Khai thác** | `-m/--modules` (readfiles,cloud,portscan), `--exploit` (= `-m all`) |
-| **Khác** | `-h/--help`, `-i/--interactive`, `--timeout`, `--concurrency`, `--time-threshold`, `-o/--output`, `--no-banner` |
+| **Khác** | `-h/--help`, `-i/--interactive`, `--proxy` (Burp), `--only-confirmed`, `--timeout`, `--concurrency`, `--time-threshold`, `-o/--output`, `--no-banner` |
 
 **Exit code** = `1` nếu có phát hiện mức `CONFIRMED`/`FIRM` (tiện tích hợp CI/CTF), ngược lại `0`.
+
+### Điểm chèn được hỗ trợ
+Tool tự tìm điểm chèn ở **query string**, **body form** (`url=...`), **body JSON** (`{"url":"..."}` — dùng `--json` hoặc tự nhận), và **header hay dính SSRF** (`Referer`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`, `True-Client-IP`, `Forwarded`). Dùng marker `FUZZ` để chỉ đúng một điểm.
+
+```bash
+# SSRF trong body JSON
+python ssrf_scanner.py -u "http://host/api" -X POST --json --data '{"url":"http://x","id":1}' --oast-listen 8000
+
+# Đi qua Burp proxy để xem/replay traffic
+python ssrf_scanner.py -u "http://host/f?url=FUZZ" --proxy http://127.0.0.1:8080 --oast-listen 8000
+
+# Chỉ hiện kết quả chắc chắn (ẩn nhiễu TENTATIVE)
+python ssrf_scanner.py -u "http://host/f?url=FUZZ" --oast-listen 8000 --only-confirmed
+```
 
 ---
 

