@@ -31,8 +31,6 @@ Python thuần · không phụ thuộc thư viện ngoài · chạy ngay
 - [8. Giải thích output](#8-giải-thích-output)
 - [9. Kiến trúc & luồng xử lý](#9-kiến-trúc--luồng-xử-lý)
 - [10. Cấu trúc project](#10-cấu-trúc-project)
-- [11. Giới hạn đã biết](#11-giới-hạn-đã-biết)
-- [12. Hướng mở rộng](#12-hướng-mở-rộng)
 
 ---
 
@@ -334,30 +332,6 @@ SSRF-Scanner/
 | `POST /login` | Đăng nhập (user demo **admin/admin123**), set cookie `sess` |
 | `GET /secure-fetch?url=` | SSRF **sau đăng nhập** (cần cookie) — test `--auth-*` |
 | `GET /latest/meta-data` | Giả lập trang metadata nội bộ |
-
----
-
-## 11. Giới hạn đã biết
-
-- **OOB ngoài (Burp Collaborator / interactsh / requestrepo / webhook.site):** tool tự
-  chọn dạng payload phù hợp — **subdomain** cho domain (bắt cả DNS), **path** cho URL có
-  đường dẫn riêng (webhook.site). Tuy nhiên tool **chỉ tự động xác nhận callback khi dùng
-  `--oast-listen`** (canary cục bộ); với dịch vụ ngoài, xem callback trên dashboard của họ
-  (chưa tích hợp API để tự đọc).
-- **IP mã hoá trên Windows:** các dạng decimal/hex/octal/`127.1` không resolve qua
-  `urllib` trên Windows, nhưng **nhiều HTTP client server-side trên Linux** (curl/libcurl,
-  Java, PHP...) resolve được — nên payload vẫn hữu ích với mục tiêu thật. Trên lab Windows,
-  dùng kỹ thuật **loopback thay thế** để minh hoạ bypass.
-
----
-
-## 12. Hướng mở rộng
-
-- [ ] Crawl form / JSON body / header (`Referer`, `X-Forwarded-For`) tự động
-- [ ] Tích hợp API **interactsh** để auto-confirm OOB qua DNS
-- [ ] DNS rebinding, redirect 302 về IP nội bộ
-- [ ] Xuất báo cáo HTML/Markdown
-- [ ] Hỗ trợ proxy (đi qua Burp để xem traffic)
 
 ---
 
