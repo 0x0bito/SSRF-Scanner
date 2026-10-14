@@ -2,21 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- ssrf_scanner.py  -  Cong cu phat hien & kiem thu lo hong SSRF  (ALL-IN-ONE)
+ ssrf_scanner.py  -  SSRF detection & testing tool  (all-in-one)
 ==============================================================================
- Do an mon hoc. Viet bang Python THUAN (>=3.10), KHONG can cai thu vien ngoai.
+ Python stdlib only (>=3.10), no external dependencies.
+ For authorized security testing only.
 
- CANH BAO DAO DUC:
-   Chi su dung tren he thong BAN SO HUU hoac DUOC CAP PHEP (lab, CTF, may ao).
-   Quet he thong khong duoc phep la vi pham phap luat.
+ Detection techniques:
+   - OAST (out-of-band): payload calls back to canary server  => CONFIRMED
+   - Direct            : response leaks internal data (metadata, root:x:0:0) => CONFIRMED
+   - Time-based        : non-responsive IP, response-time delta => FIRM
+   - Error/diff        : response differs from baseline => TENTATIVE
 
- 4 ky thuat phat hien:
-   - OAST (out-of-band): chen URL tro ve server canary; nhan callback => CHAC CHAN
-   - Direct            : response lo dau hieu noi bo (metadata, root:x:0:0) => CHAC CHAN
-   - Time-based        : tro IP khong phan hoi, do chenh lech thoi gian => KHA NANG CAO
-   - Error/diff        : response khac han baseline voi muc tieu noi bo => NGHI NGO
-
- Vi du:
+ Examples:
    python ssrf_scanner.py -u "http://127.0.0.1:5000/fetch?url=FUZZ" --oast-listen 8000
    python ssrf_scanner.py -u "http://host/page?img=http://a.com&id=1"
    python ssrf_scanner.py -u "http://host/api?target=x" -p target -o report.json
@@ -53,8 +50,7 @@ BANNER = r"""
   ___ ___ ___  ___   ___
  / __/ __| _ \| __| / __| __ __ _ _ _
  \__ \__ \   /| _|  \__ \/ _/ _` | ' \
- |___/___/_|_\|_|   |___/\__\__,_|_||_|   SSRF Scanner v1.1 (all-in-one)
-   Chi dung cho muc dich hoc tap / kiem thu DUOC CAP PHEP
+ |___/___/_|_\|_|   |___/\__\__,_|_||_|   SSRF Scanner v1.1
 """
 
 
@@ -688,7 +684,7 @@ def interactive_fill(args) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Cong cu phat hien va kiem thu SSRF (hoc tap / kiem thu duoc cap phep).",
+        description="SSRF detection & testing tool. For authorized security testing only.",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("-u", "--url", help="URL muc tieu (co the chua marker FUZZ).")
     ap.add_argument("-r", "--request", metavar="FILE",
