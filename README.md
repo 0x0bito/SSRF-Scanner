@@ -62,6 +62,7 @@ SSRF được xếp vào **CWE-918** và nằm trong **OWASP Top 10 (A10:2021)**
 - ✅ **Server canary OAST cục bộ** tự động xác nhận callback (bắt cả blind SSRF); hỗ trợ dịch vụ OOB ngoài (requestrepo/interactsh)
 - ✅ **Nhập input linh hoạt**: URL/param/marker `FUZZ`, body POST, cookie/session, đăng nhập user/pass
 - ✅ **Import raw HTTP request từ Burp Suite** (`-r`) và **chế độ tương tác** (`-i`)
+- ✅ **Module khai thác** (sau khi phát hiện): `readfiles` (đọc file nội bộ), `cloud` (lôi metadata AWS/Alibaba), `portscan` (quét cổng nội bộ qua SSRF)
 - ✅ **Quét đa luồng** (ThreadPoolExecutor), **xuất báo cáo JSON**
 - ✅ **Không phụ thuộc thư viện ngoài** — chỉ dùng thư viện chuẩn Python ≥ 3.10
 - ✅ Kèm **web lab cố ý dính SSRF** để demo an toàn
@@ -149,6 +150,21 @@ python ssrf_scanner.py -u "http://host/f?url=FUZZ" --oob-url "https://webhook.si
 python ssrf_scanner.py -u "http://host/f?url=FUZZ" --oast-listen 8000 -o report.json
 ```
 
+### Khai thác sau khi phát hiện (exploitation modules)
+Sau khi xác nhận có SSRF, dùng `-m` để khai thác (chỉ đọc dữ liệu):
+```bash
+# Chay tat ca module
+python ssrf_scanner.py -u "http://host/fetch?url=FUZZ" --exploit
+
+# Chon tung module
+python ssrf_scanner.py -u "http://host/fetch?url=FUZZ" -m readfiles,cloud,portscan
+```
+| Module | Làm gì |
+|---|---|
+| `readfiles` | Đọc file nội bộ qua `file://` (`/etc/passwd`, `/proc/self/environ`...) và in nội dung |
+| `cloud` | Lôi metadata cloud (AWS IAM creds / instance-id, Alibaba) — chỉ nhận giá trị thật, tránh báo nhầm |
+| `portscan` | Quét cổng nội bộ qua SSRF, so sánh baseline để phân biệt open/closed |
+
 ### Bảng tham số
 
 | Nhóm | Cờ |
@@ -156,6 +172,7 @@ python ssrf_scanner.py -u "http://host/f?url=FUZZ" --oast-listen 8000 -o report.
 | **Mục tiêu** | `-u/--url`, `-r/--request` (Burp), `--https`, `-p/--param`, `-X/--method`, `--data`, `-H/--header` |
 | **Phiên / đăng nhập** | `--cookie`, `--auth-url`, `--auth-user`, `--auth-pass`, `--auth-user-field`, `--auth-pass-field` |
 | **OOB / OAST** | `--oast-listen` (canary cục bộ, tự xác nhận), `--oob-url` / `--oast-host` (dịch vụ ngoài) |
+| **Khai thác** | `-m/--modules` (readfiles,cloud,portscan), `--exploit` (= `-m all`) |
 | **Khác** | `-h/--help`, `-i/--interactive`, `--timeout`, `--concurrency`, `--time-threshold`, `-o/--output`, `--no-banner` |
 
 **Exit code** = `1` nếu có phát hiện mức `CONFIRMED`/`FIRM` (tiện tích hợp CI/CTF), ngược lại `0`.
