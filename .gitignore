@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Config cục bộ của Claude Code / IDE
+.claude/
+.idea/
+.vscode/
+
+# Output / báo cáo sinh ra khi chạy
+report.json
+*.report.json
+scan-*.json
+
+# OS
+.DS_Store
+Thumbs.db

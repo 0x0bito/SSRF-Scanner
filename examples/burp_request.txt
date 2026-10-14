@@ -1,0 +1,8 @@
+POST /fetch HTTP/1.1
+Host: 127.0.0.1:5000
+User-Agent: Mozilla/5.0
+Cookie: sess=secret-session-123
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 21
+
+url=http://example.com

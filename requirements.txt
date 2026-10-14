@@ -1,0 +1,2 @@
+# Khong can thu vien ngoai - tool chi dung thu vien chuan cua Python (>=3.10).
+# File nay de trong co y de nhan manh: chay ngay, khong can pip install.
